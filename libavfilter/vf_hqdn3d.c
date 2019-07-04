@@ -50,8 +50,15 @@
 av_always_inline
 static uint32_t lowpass(int prev, int cur, int16_t *coef, int depth)
 {
+    // printf("lowpass depth val %d\n", depth);
+    // printf("prev %d curr %d\n",prev, cur);
+    //索引值为 前一个像素减去后一个像素的差值 
+    //差值最多 256 d最大值为 256 / 2^4 (depth = 8)
+    //差值最小 -256 d最小值为 -256 / 2^4
+    //右移 8-LUT_BITS 寻找到索引
     int d = (prev - cur) >> (8 - LUT_BITS);
-    return cur + coef[d];
+    //printf("cur %d coef[%d] %d \n",cur, d, coef[d]);
+    return cur + coef[d]; //返回滤波值, 对cur值进行一定的补偿
 }
 
 av_always_inline
@@ -64,7 +71,7 @@ static void denoise_temporal(uint8_t *src, uint8_t *dst,
     uint32_t tmp;
 
     temporal += 256 << LUT_BITS;
-
+    //和前一帧做时域滤波
     for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
             frame_ant[x] = tmp = lowpass(frame_ant[x], LOAD(x), temporal, depth);
@@ -83,6 +90,7 @@ static void denoise_spatial(HQDN3DContext *s,
                             int w, int h, int sstride, int dstride,
                             int16_t *spatial, int16_t *temporal, int depth)
 {
+    //printf("denoise_spatial depth val %d\n", depth);
     long x, y;
     uint32_t pixel_ant;
     uint32_t tmp;
@@ -92,28 +100,49 @@ static void denoise_spatial(HQDN3DContext *s,
 
     /* First line has no top neighbor. Only left one for each tmp and
      * last frame */
+    //读取第一个像素数据
+    //第一行没有上一行的数据，所以只做左右像素的空域滤波
     pixel_ant = LOAD(0);
+    //printf("raw pixel_ant %d src %d ret %d\n", pixel_ant, src[0], pixel_ant /src[0]);
     for (x = 0; x < w; x++) {
+        //行缓存前一个像素和当前像素的低通空域滤波
+        //printf("read pixel %d depth %d\n", pixel_ant, depth);
         line_ant[x] = tmp = pixel_ant = lowpass(pixel_ant, LOAD(x), spatial, depth);
+        //上一帧的第一行和当前行缓存做低通时域滤波
         frame_ant[x] = tmp = lowpass(frame_ant[x], tmp, temporal, depth);
+        //printf("write pixel tmp %d depth %d\n", tmp, depth);
         STORE(x, tmp);
+        //printf("write pixel dst %d\n", dst[x]);
     }
 
+
+    //处理第一行以外的行
     for (y = 1; y < h; y++) {
+        //更新src和dst指针位置
         src += sstride;
         dst += dstride;
+        //更新前一帧指针位置
         frame_ant += w;
+        //并行计算
         if (s->denoise_row[depth]) {
             s->denoise_row[depth](src, dst, line_ant, frame_ant, w, spatial, temporal);
             continue;
         }
+        //读取行中第一个像素点
         pixel_ant = LOAD(0);
+        //处理一行
         for (x = 0; x < w-1; x++) {
+            //上一行和当前行的空域滤波
             line_ant[x] = tmp = lowpass(line_ant[x], pixel_ant, spatial, depth);
+            //当前像素和下一个像素的空域滤波
             pixel_ant = lowpass(pixel_ant, LOAD(x+1), spatial, depth);
+            //当前帧和前一帧做时域滤波
             frame_ant[x] = tmp = lowpass(frame_ant[x], tmp, temporal, depth);
+            //printf("write pixel tmp %d depth %d\n", tmp, depth);
+            //保存到结果位置
             STORE(x, tmp);
         }
+        //最后一个像素点不计算pixel_ant
         line_ant[x] = tmp = lowpass(line_ant[x], pixel_ant, spatial, depth);
         frame_ant[x] = tmp = lowpass(frame_ant[x], tmp, temporal, depth);
         STORE(x, tmp);
@@ -129,26 +158,35 @@ static int denoise_depth(HQDN3DContext *s,
 {
     // FIXME: For 16-bit depth, frame_ant could be a pointer to the previous
     // filtered frame rather than a separate buffer.
+    //printf("denoise_depth depth val %d\n", depth);
     long x, y;
     uint16_t *frame_ant = *frame_ant_ptr;
+    //前帧空间为空，则创建空间
     if (!frame_ant) {
         uint8_t *frame_src = src;
+        //创建帧缓存数据 为int16 大小w*h
         *frame_ant_ptr = frame_ant = av_malloc_array(w, h*sizeof(uint16_t));
         if (!frame_ant)
             return AVERROR(ENOMEM);
+        //保存当前帧的数据
         for (y = 0; y < h; y++, src += sstride, frame_ant += w)
             for (x = 0; x < w; x++)
                 frame_ant[x] = LOAD(x);
+        //指针指回首地址
         src = frame_src;
         frame_ant = *frame_ant_ptr;
     }
 
-    if (spatial[0])
+    if (spatial[0]){
         denoise_spatial(s, src, dst, line_ant, frame_ant,
-                        w, h, sstride, dstride, spatial, temporal, depth);
-    else
+                           w, h, sstride, dstride, spatial, temporal, depth);
+    }
+    else 
+    {
+        //printf("denoise_temporal only\n");
         denoise_temporal(src, dst, frame_ant,
                          w, h, sstride, dstride, temporal, depth);
+    }
     emms_c();
     return 0;
 }
@@ -172,17 +210,26 @@ static int denoise_depth(HQDN3DContext *s,
 
 static int16_t *precalc_coefs(double dist25, int depth)
 {
+    printf("precalc_coefs depth val %d dist25 %0.8f\n", depth, dist25);
     int i;
     double gamma, simil, C;
     int16_t *ct = av_malloc((512<<LUT_BITS)*sizeof(int16_t));
     if (!ct)
         return NULL;
-
+    
+    //换底公式：log(1 - 强度%) (0.25) // (1 - 强度%)^gamma = 0.25 理解为误差减小25% ??
     gamma = log(0.25) / log(1.0 - FFMIN(dist25,252.0)/255.0 - 0.00001);
 
+    //两个像素的差值范围 -256 ~ 256
+    //左移4bits 编程int12
     for (i = -256<<LUT_BITS; i < 256<<LUT_BITS; i++) {
+        //左移5bits变成int17 + 1111(2) / 512（相当于右移9bits, 又变成了8bits，但是这里是double保留了精度）
+        //相当于变换到8bits 浮点范围
+        //bin宽系数
         double f = ((i<<(9-LUT_BITS)) + (1<<(8-LUT_BITS)) - 1) / 512.0; // midpoint of the bin
+        //计算差值强度百分比
         simil = FFMAX(0, 1.0 - fabs(f) / 255.0);
+        //根据之前系数gamma 补偿到0.25
         C = pow(simil, gamma) * 256.0 * f;
         ct[(256<<LUT_BITS)+i] = lrint(C);
     }
@@ -197,8 +244,8 @@ static int16_t *precalc_coefs(double dist25, int depth)
 
 static av_cold int init(AVFilterContext *ctx)
 {
-    HQDN3DContext *s = ctx->priv;
-
+    HQDN3DContext *s = ctx->priv;               
+    //初始化亮度和色度对应强度
     if (!s->strength[LUMA_SPATIAL])
         s->strength[LUMA_SPATIAL] = PARAM1_DEFAULT;
     if (!s->strength[CHROMA_SPATIAL])
@@ -270,7 +317,8 @@ static int config_input(AVFilterLink *inlink)
     s->hsub  = desc->log2_chroma_w;
     s->vsub  = desc->log2_chroma_h;
     s->depth = desc->comp[0].depth;
-
+    printf("s->depth %d\n",  s->depth);
+    //申请行缓存空间
     s->line = av_malloc_array(inlink->w, sizeof(*s->line));
     if (!s->line)
         return AVERROR(ENOMEM);
@@ -311,8 +359,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     for (c = 0; c < 3; c++) {
         denoise(s, in->data[c], out->data[c],
                 s->line, &s->frame_prev[c],
-                AV_CEIL_RSHIFT(in->width,  (!!c * s->hsub)),
-                AV_CEIL_RSHIFT(in->height, (!!c * s->vsub)),
+                AV_CEIL_RSHIFT(in->width,  (!!c * s->hsub)), //亮度通道直接传width
+                AV_CEIL_RSHIFT(in->height, (!!c * s->vsub)), //色度通道传入width >> 1
                 in->linesize[c], out->linesize[c],
                 s->coefs[c ? CHROMA_SPATIAL : LUMA_SPATIAL],
                 s->coefs[c ? CHROMA_TMP     : LUMA_TMP]);
